@@ -3,17 +3,19 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from model2vec import StaticModel
 
 from semble import SembleIndex
 from semble.index.create import _MAX_FILE_BYTES, create_index_from_path
-from semble.types import ContentType, Encoder
+from semble.types import ContentType
 from tests.conftest import make_chunk
 
 
 @pytest.fixture
 def indexed_index(mock_model: Any, tmp_project: Path) -> SembleIndex:
     """SembleIndex built from tmp_project."""
-    return SembleIndex.from_path(tmp_project, model=mock_model)
+    with patch("semble.index.index.load_model", return_value=(mock_model, "")):
+        return SembleIndex.from_path(tmp_project)
 
 
 @pytest.mark.parametrize(
@@ -25,7 +27,7 @@ def indexed_index(mock_model: Any, tmp_project: Path) -> SembleIndex:
     ],
 )
 def test_index_markdown_inclusion(
-    mock_model: Encoder, tmp_project: Path, content: list[ContentType], md_in_results: bool
+    mock_model: StaticModel, tmp_project: Path, content: list[ContentType], md_in_results: bool
 ) -> None:
     """Markdown files are excluded for code-only and included when docs is requested."""
     _, _, chunks = create_index_from_path(tmp_project, mock_model, content=content)
@@ -33,37 +35,39 @@ def test_index_markdown_inclusion(
     assert has_md is md_in_results
 
 
-def test_include_text_files_deprecated(mock_model: Encoder, tmp_project: Path) -> None:
+def test_include_text_files_deprecated(mock_model: Any, tmp_project: Path) -> None:
     """include_text_files=True warns and expands to all content types; False warns and resets to code-only."""
     from semble.index.index import _ALL_CONTENT, _DEFAULT_CONTENT
 
-    with pytest.warns(DeprecationWarning, match="include_text_files is deprecated"):
-        idx = SembleIndex.from_path(tmp_project, model=mock_model, include_text_files=True)
-    assert idx._content == _ALL_CONTENT
+    with patch("semble.index.index.load_model", return_value=(mock_model, "")):
+        with pytest.warns(DeprecationWarning, match="include_text_files is deprecated"):
+            idx = SembleIndex.from_path(tmp_project, include_text_files=True)
+        assert idx._content == _ALL_CONTENT
 
-    with pytest.warns(DeprecationWarning, match="include_text_files is deprecated"):
-        idx = SembleIndex.from_path(tmp_project, model=mock_model, include_text_files=False)
-    assert idx._content == _DEFAULT_CONTENT
+        with pytest.warns(DeprecationWarning, match="include_text_files is deprecated"):
+            idx = SembleIndex.from_path(tmp_project, include_text_files=False)
+        assert idx._content == _DEFAULT_CONTENT
 
 
-def test_from_git_include_text_files_deprecated(mock_model: Encoder, tmp_project: Path) -> None:
+def test_from_git_include_text_files_deprecated(mock_model: Any, tmp_project: Path) -> None:
     """from_git raises DeprecationWarning when include_text_files is passed."""
     fake_result = MagicMock()
     fake_result.returncode = 0
-    with patch("subprocess.run", return_value=fake_result):
-        with patch("semble.index.index.create_index_from_path") as mock_create:
-            mock_create.return_value = (MagicMock(), MagicMock(), [make_chunk("x = 1", "f.py")])
-            with pytest.warns(DeprecationWarning, match="include_text_files is deprecated"):
-                SembleIndex.from_git("https://example.com/repo", model=mock_model, include_text_files=True)
+    with patch("semble.index.index.load_model", return_value=(mock_model, "")):
+        with patch("subprocess.run", return_value=fake_result):
+            with patch("semble.index.index.create_index_from_path") as mock_create:
+                mock_create.return_value = (MagicMock(), MagicMock(), [make_chunk("x = 1", "f.py")])
+                with pytest.warns(DeprecationWarning, match="include_text_files is deprecated"):
+                    SembleIndex.from_git("https://example.com/repo", include_text_files=True)
 
 
-def test_index_empty_returns_zero_chunks(mock_model: Encoder, tmp_path: Path) -> None:
+def test_index_empty_returns_zero_chunks(mock_model: StaticModel, tmp_path: Path) -> None:
     """Indexing an empty directory yields zero files and chunks."""
     with pytest.raises(ValueError):
         create_index_from_path(tmp_path, mock_model)
 
 
-def test_oversized_file_is_skipped(mock_model: Encoder, tmp_path: Path) -> None:
+def test_oversized_file_is_skipped(mock_model: StaticModel, tmp_path: Path) -> None:
     """Files exceeding _MAX_FILE_BYTES are silently skipped during indexing."""
     (tmp_path / "big.py").write_bytes(b"x" * (_MAX_FILE_BYTES + 1))
     with pytest.raises(ValueError):  # no indexable content remains
@@ -123,10 +127,10 @@ def test_search_without_reranking(indexed_index: SembleIndex) -> None:
     ],
 )
 def test_search_rerank_default_by_content_type(
-    mock_model: Encoder, content: list[ContentType], expect_rerank: bool
+    mock_model: Any, content: list[ContentType], expect_rerank: bool
 ) -> None:
     """Reranking is on by default when code is indexed, off for non-code-only content."""
-    index = SembleIndex(mock_model, MagicMock(), MagicMock(), [make_chunk("x = 1", "f.py")], content=content)
+    index = SembleIndex(mock_model, MagicMock(), MagicMock(), [make_chunk("x = 1", "f.py")], "", content=content)
     with patch("semble.index.index.search", return_value=[]) as mock_search:
         index.search("function", top_k=3)
     assert mock_search.call_args.kwargs["rerank"] == expect_rerank
@@ -170,3 +174,37 @@ def test_find_related(indexed_index: SembleIndex) -> None:
     assert [r.chunk for r in indexed_index.find_related(result, top_k=3)] == [
         r.chunk for r in indexed_index.find_related(result.chunk, top_k=3)
     ]
+
+
+def test_roundtrip(tmp_path: Path, indexed_index: SembleIndex) -> None:
+    """Test that saving and loading a folder leads to the same data."""
+    indexed_index.save(tmp_path)
+    with patch.object(StaticModel, "from_pretrained"):
+        index_2 = SembleIndex.load_from_disk(tmp_path)
+    assert index_2.chunks == indexed_index.chunks
+    assert index_2._root == indexed_index._root
+
+
+def test_load_non_existent(tmp_path: Path, indexed_index: SembleIndex) -> None:
+    """Test that saving and loading a folder leads to the same data."""
+    with pytest.raises(FileNotFoundError):
+        SembleIndex.load_from_disk(tmp_path / "temp")
+
+
+def test_load_from_disk_missing_files_reports_them(tmp_path: Path) -> None:
+    """When the directory exists but required index files are missing, the error lists them."""
+    index_dir = tmp_path / "incomplete_index"
+    index_dir.mkdir()
+    # Create only one of the four expected files so the rest are reported as missing.
+    (index_dir / "chunks.json").write_text("[]")
+
+    with pytest.raises(FileNotFoundError, match="Missing:") as exc_info:
+        SembleIndex.load_from_disk(index_dir)
+
+    error_msg = str(exc_info.value)
+    # The three missing files should all appear in the error message.
+    assert "bm25_index" in error_msg
+    assert "semantic_index" in error_msg
+    assert "metadata.json" in error_msg
+    # The file we did create should NOT be listed as missing.
+    assert "chunks.json" not in error_msg

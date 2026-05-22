@@ -12,7 +12,7 @@ from model2vec.utils import get_package_extras
 from semble.index import SembleIndex
 from semble.stats import format_savings_report
 from semble.types import ContentType
-from semble.utils import _format_results, _is_git_url, _resolve_chunk
+from semble.utils import format_results, is_git_url, resolve_chunk
 
 
 class Agent(str, Enum):
@@ -25,7 +25,7 @@ class Agent(str, Enum):
 
 
 _DEFAULT_AGENT = Agent.CLAUDE
-_CLI_DISPATCH_ARGS = frozenset({"search", "find-related", "init", "savings", "-h", "--help"})
+_CLI_DISPATCH_ARGS = frozenset({"search", "find-related", "init", "savings", "-h", "--help", "index"})
 
 
 def _agent_path(agent: Agent) -> Path:
@@ -82,6 +82,16 @@ def _mcp_main() -> None:
     asyncio.run(serve(args.path, ref=args.ref, content=content))
 
 
+def _run_index(*, path: str, include_text_files: bool = False, out: str) -> None:
+    """Index and store a codebase."""
+    if is_git_url(path):
+        index = SembleIndex.from_git(path, include_text_files=include_text_files)
+    else:
+        index = SembleIndex.from_path(path, include_text_files=include_text_files)
+    Path(out).mkdir(parents=True, exist_ok=True)
+    index.save(out)
+
+
 def _run_init(*, agent: Agent = _DEFAULT_AGENT, force: bool = False) -> None:
     """Write the semble sub-agent file for the given coding agent into the current project."""
     dest = _agent_path(agent)
@@ -111,10 +121,20 @@ def _cli_main() -> None:
     parser = argparse.ArgumentParser(prog="semble")
     sub = parser.add_subparsers(dest="command")
 
+    index_p = sub.add_parser("index", help="Index and store a codebase.")
+    index_p.add_argument("path", nargs="?", default=".", help="Local path or git URL (default: current directory).")
+    index_p.add_argument(
+        "--include-text-files",
+        action="store_true",
+        help="Also index non-code text files (.md, .yaml, .json, etc.).",
+    )
+    index_p.add_argument("-o", "--out", type=str, required=True, help="The path to write the pre-built index to.")
+
     search_p = sub.add_parser("search", help="Search a codebase.")
     search_p.add_argument("query", help="Natural language or code query.")
     search_p.add_argument("path", nargs="?", default=".", help="Local path or git URL (default: current directory).")
     search_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
+    search_p.add_argument("--index", type=str, default=None, help="A path pointing to a pre-built index.")
     _add_content_args(search_p)
 
     related_p = sub.add_parser("find-related", help="Find code similar to a specific location.")
@@ -122,6 +142,7 @@ def _cli_main() -> None:
     related_p.add_argument("line", type=int, help="Line number (1-indexed).")
     related_p.add_argument("path", nargs="?", default=".", help="Local path or git URL (default: current directory).")
     related_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
+    related_p.add_argument("--index", type=str, default=None, help="A path pointing to a pre-built index.")
     _add_content_args(related_p)
 
     init_p = sub.add_parser("init", help="Write a semble sub-agent file for your coding agent.")
@@ -143,26 +164,33 @@ def _cli_main() -> None:
         _run_init(agent=Agent(args.agent), force=args.force)
         return
 
+    if args.command == "index":
+        _run_index(path=args.path, include_text_files=args.include_text_files, out=args.out)
+        return
+
     if args.command == "savings":
         print(format_savings_report(verbose=args.verbose), end="")
         return
 
-    content = _resolve_content(args.content, args.include_text_files)
-    index = (
-        SembleIndex.from_git(args.path, content=content)
-        if _is_git_url(args.path)
-        else SembleIndex.from_path(args.path, content=content)
-    )
+    if args.index:
+        index = SembleIndex.load_from_disk(args.index)
+    else:
+        content = _resolve_content(args.content, args.include_text_files)
+        index = (
+            SembleIndex.from_git(args.path, content=content)
+            if is_git_url(args.path)
+            else SembleIndex.from_path(args.path, content=content)
+        )
 
     if args.command == "search":
         results = index.search(args.query, top_k=args.top_k)
         if not results:
             print("No results found.")
         else:
-            print(_format_results(f"Search results for: {args.query!r}", results))
+            print(format_results(f"Search results for: {args.query!r}", results))
 
     elif args.command == "find-related":
-        chunk = _resolve_chunk(index.chunks, args.file_path, args.line)
+        chunk = resolve_chunk(index.chunks, args.file_path, args.line)
         if chunk is None:
             print(f"No chunk found at {args.file_path}:{args.line}.", file=sys.stderr)
             sys.exit(1)
@@ -170,4 +198,4 @@ def _cli_main() -> None:
         if not results:
             print(f"No related chunks found for {args.file_path}:{args.line}.")
         else:
-            print(_format_results(f"Chunks related to {args.file_path}:{args.line}", results))
+            print(format_results(f"Chunks related to {args.file_path}:{args.line}", results))

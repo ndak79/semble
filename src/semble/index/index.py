@@ -6,17 +6,21 @@ import tempfile
 import warnings
 from collections import defaultdict
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
+import orjson
 from bm25s import BM25
+from model2vec.model import StaticModel
 
 from semble.index.create import create_index_from_path
 from semble.index.dense import SelectableBasicBackend, load_model
+from semble.index.types import PersistencePath
 from semble.search import _search_semantic, search
 from semble.stats import save_search_stats
-from semble.types import CallType, Chunk, ContentType, Encoder, IndexStats, SearchResult
+from semble.types import CallType, Chunk, ContentType, IndexStats, SearchResult
 
 _GIT_CLONE_TIMEOUT = int(os.environ.get("SEMBLE_CLONE_TIMEOUT", 60))
 _DEFAULT_CONTENT: tuple[ContentType, ...] = (ContentType.CODE,)
@@ -46,10 +50,11 @@ class SembleIndex:
 
     def __init__(
         self,
-        model: Encoder,
+        model: StaticModel,
         bm25_index: BM25,
         semantic_index: SelectableBasicBackend,
         chunks: list[Chunk],
+        model_path: str,
         root: Path | None = None,
         content: ContentType | Sequence[ContentType] = _DEFAULT_CONTENT,
     ) -> None:
@@ -59,13 +64,15 @@ class SembleIndex:
         :param bm25_index: The bm25 index.
         :param semantic_index: The semantic index.
         :param chunks: The found chunks.
+        :param model_path: Path to the model file.
         :param root: Root directory used to read file sizes for token-savings stats.
         :param content: Content type used when indexing; controls the search pipeline.
         """
-        self.model: Encoder = model
+        self.model = model
         self.chunks: list[Chunk] = chunks
         self._bm25_index: BM25 = bm25_index
         self._semantic_index: SelectableBasicBackend = semantic_index
+        self._model_path: str = model_path
         self._root: Path | None = root
         self._content: tuple[ContentType, ...] = (content,) if isinstance(content, ContentType) else tuple(content)
         self._file_sizes: dict[str, int] = self._compute_file_sizes(root) if root else {}
@@ -113,24 +120,24 @@ class SembleIndex:
     def from_path(
         cls,
         path: str | Path,
-        model: Encoder | None = None,
         extensions: Sequence[str] | None = None,
         content: ContentType | Sequence[ContentType] = _DEFAULT_CONTENT,
         include_text_files: bool | None = None,
+        model_path: str | None = None,
     ) -> SembleIndex:
         """Create and index a SembleIndex from a directory.
 
         :param path: Root directory to index.
-        :param model: Embedding model to use. Defaults to potion-code-16M.
         :param extensions: File extensions to include. Defaults to a standard set of code extensions.
         :param content: Content types to index, e.g. ContentType.CODE or [ContentType.CODE, ContentType.DOCS].
         :param include_text_files: Deprecated. Pass a content sequence directly instead.
-        :return: An indexed SembleIndex. Chunk file paths are relative to path.
+        :param model_path: Path to the model to use. If None, the default model will be used.
+        :return: An indexed SembleIndex. Chunk file paths are relative to ``path``.
         :raises FileNotFoundError: If `path` does not exist.
         :raises NotADirectoryError: If `path` exists but is not a directory.
         """
+        model, model_path = load_model(model_path)
         normalized = _apply_include_text_files(content, include_text_files)
-        model = model or load_model()
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Path does not exist: {path}")
@@ -145,15 +152,15 @@ class SembleIndex:
             display_root=path,
         )
 
-        return SembleIndex(model, bm25, vicinity, chunks, root=path, content=normalized)
+        return SembleIndex(model, bm25, vicinity, chunks, model_path, root=path, content=normalized)
 
     @classmethod
     def from_git(
         cls,
         url: str,
         ref: str | None = None,
-        model: Encoder | None = None,
         extensions: Sequence[str] | None = None,
+        model_path: str | None = None,
         content: ContentType | Sequence[ContentType] = _DEFAULT_CONTENT,
         include_text_files: bool | None = None,
     ) -> SembleIndex:
@@ -166,11 +173,11 @@ class SembleIndex:
 
         :param url: URL of the git repository to clone (any git provider).
         :param ref: Branch or tag to check out. Defaults to the remote HEAD.
-        :param model: Embedding model to use. Defaults to potion-code-16M.
         :param extensions: File extensions to include. Defaults to a standard set of code extensions.
+        :param model_path: Path to the model to use. If None, the default model will be used.
         :param content: Content types to index, e.g. (ContentType.CODE,) or (ContentType.CODE, ContentType.DOCS).
         :param include_text_files: Deprecated. Pass content=(ContentType.CODE, ContentType.DOCS, ...) instead.
-        :return: An indexed SembleIndex. Chunk file paths are repo-relative (e.g. src/foo.py).
+        :return: An indexed SembleIndex. Chunk file paths are repo-relative (e.g. ``src/foo.py``).
         :raises RuntimeError: If git is not on PATH, the clone fails, or times out.
         """
         normalized = _apply_include_text_files(content, include_text_files)
@@ -187,7 +194,8 @@ class SembleIndex:
                 raise RuntimeError(f"git clone timed out for {url!r} (limit: {_GIT_CLONE_TIMEOUT} s)") from None
             if result.returncode != 0:
                 raise RuntimeError(f"git clone failed for {url!r}:\n{result.stderr.strip()}")
-            model = model or load_model()
+
+            model, model_path = load_model(model_path)
             resolved_path = Path(tmp_dir).resolve()
             bm25, vicinity, chunks = create_index_from_path(
                 resolved_path,
@@ -197,7 +205,7 @@ class SembleIndex:
                 display_root=resolved_path,
             )
 
-            return SembleIndex(model, bm25, vicinity, chunks, root=resolved_path, content=normalized)
+            return SembleIndex(model, bm25, vicinity, chunks, model_path, root=resolved_path, content=normalized)
 
     def find_related(self, source: Chunk | SearchResult, *, top_k: int = 5) -> list[SearchResult]:
         """Return chunks semantically similar to the given chunk or search result.
@@ -267,3 +275,53 @@ class SembleIndex:
         )
         save_search_stats(results, CallType.SEARCH, self._file_sizes)
         return results
+
+    @classmethod
+    def load_from_disk(cls: type[SembleIndex], path: Path | str) -> SembleIndex:
+        """Load the index from disk."""
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Index not found at {path}")
+        persistence_paths = PersistencePath.from_path(path)
+        non_existent = persistence_paths.non_existing()
+        if non_existent:
+            missing = ", ".join(str(p) for p in non_existent)
+            raise FileNotFoundError(f"Index not found at {path}. Missing: {missing}")
+
+        bm_25_index = BM25.load(persistence_paths.bm25_index)
+        semantic_index = SelectableBasicBackend.load(persistence_paths.semantic_index)
+        with open(persistence_paths.metadata, "r") as f:
+            metadata = orjson.loads(f.read())
+        with open(persistence_paths.chunks, "r") as f:
+            chunk_data = orjson.loads(f.read())
+
+        chunks = []
+        for chunk_item in chunk_data:
+            chunks.append(Chunk.from_dict(chunk_item))
+        root_path = metadata["root_path"]
+        model_path = metadata["model_path"]
+        if root_path:
+            root_path = Path(root_path)
+
+        model, model_path = load_model(model_path)
+
+        return cls(model, bm_25_index, semantic_index, chunks, model_path, root=root_path)
+
+    def save(self, path: Path | str) -> None:
+        """Save the index to disk."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        persistence_paths = PersistencePath.from_path(path)
+
+        self._bm25_index.save(persistence_paths.bm25_index)
+        self._semantic_index.save(persistence_paths.semantic_index)
+        chunks_as_dict = [chunk.to_dict() for chunk in self.chunks]
+        with open(persistence_paths.chunks, "wb") as f:
+            data = orjson.dumps(chunks_as_dict)
+            f.write(data)
+        root_str = None if self._root is None else str(self._root)
+        metadata = {"root_path": root_str, "time": datetime.now().timestamp(), "model_path": self._model_path}
+        with open(persistence_paths.metadata, "wb") as f:
+            data = orjson.dumps(metadata)
+            f.write(data)

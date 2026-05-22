@@ -13,8 +13,8 @@ from pydantic import Field
 
 from semble.index import SembleIndex
 from semble.index.dense import load_model
-from semble.types import ContentType, Encoder
-from semble.utils import _format_results, _is_git_url, _resolve_chunk
+from semble.types import ContentType
+from semble.utils import format_results, is_git_url, resolve_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ async def _get_index(
     cache: _IndexCache,
 ) -> SembleIndex:
     """Return a cached index for a repo, rejecting unsafe git transport schemes."""
-    if repo is not None and _is_git_url(repo) and not repo.startswith(("https://", "http://")):
+    if repo is not None and is_git_url(repo) and not repo.startswith(("https://", "http://")):
         raise ValueError(f"Only https://, http://, or local directory paths are accepted as `repo`. Got: {repo!r}")
     source = repo or default_source
     if not source:
@@ -78,7 +78,7 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         results = index.search(query, top_k=top_k)
         if not results:
             return "No results found."
-        return _format_results(f"Search results for: {query!r}", results)
+        return format_results(f"Search results for: {query!r}", results)
 
     @server.tool()
     async def find_related(
@@ -99,7 +99,7 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
             index = await _get_index(repo, default_source, cache)
         except ValueError as exc:
             return str(exc)
-        chunk = _resolve_chunk(index.chunks, file_path, line)
+        chunk = resolve_chunk(index.chunks, file_path, line)
         if chunk is None:
             return (
                 f"No chunk found at {file_path}:{line}. "
@@ -108,7 +108,7 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         results = index.find_related(chunk, top_k=top_k)
         if not results:
             return f"No related chunks found for {file_path}:{line}."
-        return _format_results(f"Chunks related to {file_path}:{line}", results)
+        return format_results(f"Chunks related to {file_path}:{line}", results)
 
     return server
 
@@ -124,7 +124,7 @@ async def serve(
     async def _load_and_prewarm() -> None:
         """Pre-load the model and optionally pre-index the default source in parallel with starting the server."""
         try:
-            cache._model = await asyncio.to_thread(load_model)
+            _, cache._model_path = await asyncio.to_thread(load_model)
         except Exception as exc:
             logger.exception("Failed to load embedding model")
             cache._model_error = exc
@@ -136,7 +136,7 @@ async def serve(
                 await cache.get(path, ref=ref)
             except Exception:
                 logger.warning("Failed to pre-index %r at startup", path, exc_info=True)
-            if not _is_git_url(path):
+            if not is_git_url(path):
                 await cache.start_watcher(path)
 
     init_task = asyncio.create_task(_load_and_prewarm())
@@ -151,28 +151,26 @@ async def serve(
 class _IndexCache:
     """Cache of indexed repos and local paths for the lifetime of the MCP server process."""
 
-    def __init__(self, model: Encoder | None = None, content: Sequence[ContentType] = (ContentType.CODE,)) -> None:
+    def __init__(self, content: Sequence[ContentType] = (ContentType.CODE,)) -> None:
         """Initialise an empty cache."""
-        self._model: Encoder | None = model
+        self._model_path: str | None = None
         self._model_error: BaseException | None = None
         self._model_ready = asyncio.Event()
-        if model is not None:
-            self._model_ready.set()
         self._content = content
         self._tasks: OrderedDict[str, asyncio.Task[SembleIndex]] = OrderedDict()  # ordered for LRU eviction
         self._watcher_task: asyncio.Task[None] | None = None
 
-    async def _await_model(self) -> Encoder:
+    async def _await_model(self) -> str:
         """Block until the model is installed; re-raise the load error if it failed."""
         await self._model_ready.wait()
         if self._model_error is not None:
             raise self._model_error
-        assert self._model is not None
-        return self._model
+        assert self._model_path is not None
+        return self._model_path
 
     def _compute_cache_key(self, source: str, ref: str | None = None) -> str:
         """Compute the canonical cache key for a source."""
-        is_git = _is_git_url(source)
+        is_git = is_git_url(source)
         return (f"{source}@{ref}" if ref else source) if is_git else str(Path(source).resolve())
 
     def evict(self, source: str) -> None:
@@ -199,18 +197,18 @@ class _IndexCache:
         cache_key = self._compute_cache_key(source, ref)
 
         if cache_key not in self._tasks:
-            model = await self._await_model()
+            model_path = await self._await_model()
             # Re-check after the await: another caller may have populated the entry.
             if cache_key not in self._tasks:
                 if len(self._tasks) >= _CACHE_MAX_SIZE:
                     self._tasks.popitem(last=False)
-                if _is_git_url(source):
+                if is_git_url(source):
                     self._tasks[cache_key] = asyncio.create_task(
                         asyncio.to_thread(
                             SembleIndex.from_git,
                             source,
                             ref=ref,
-                            model=model,
+                            model_path=model_path,
                             content=self._content,
                         )
                     )
@@ -219,7 +217,7 @@ class _IndexCache:
                         asyncio.to_thread(
                             SembleIndex.from_path,
                             cache_key,
-                            model=model,
+                            model_path=model_path,
                             content=self._content,
                         )
                     )
